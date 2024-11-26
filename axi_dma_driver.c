@@ -155,7 +155,7 @@ static int axidma_probe(struct platform_device *pdev)
     platform_set_drvdata(pdev, lp);
     
     /* Perform a DMA reset */
-    //axidma_reset(lp);
+    // axidma_reset(lp);
 
     LOG_INFO(dev, "AXI DMA successfully probed\n");
     return 0;
