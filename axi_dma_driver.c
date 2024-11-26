@@ -87,7 +87,6 @@ static irqreturn_t axidma_irq_handler(int irq, void *dev_id)
 static int axidma_probe(struct platform_device *pdev)
 {
     struct resource *r_mem;
-    struct resource *r_irq_mm2s, *r_irq_s2mm;
     struct axidma_local *lp;
     struct device *dev = &pdev->dev;
     int ret;
@@ -125,38 +124,38 @@ static int axidma_probe(struct platform_device *pdev)
 
     LOG_INFO(dev, "Memory mapped at %p\n", lp->base_addr);
 
-    /* Get MM2S IRQ */
+    /* Map MM2S and S2MM interrupts */
     lp->irq_mm2s = platform_get_irq(pdev, 0);
     if (lp->irq_mm2s < 0) {
-        dev_err(dev, "Failed to get MM2S IRQ\n");
-        return lp->irq_mm2s;
+        LOG_ERR(dev, "Failed to get MM2S IRQ\n");
+    } else {
+        ret = devm_request_irq(dev, lp->irq_mm2s, axidma_irq_handler, 0, DRIVER_NAME, lp);
+        if (ret) {
+            LOG_ERR(dev, "Failed to request MM2S IRQ %d\n", lp->irq_mm2s);
+            return ret;
+        }
+        LOG_INFO(dev, "MM2S IRQ %d registered\n", lp->irq_mm2s);
     }
 
-    /* Request MM2S IRQ */
-    rc = devm_request_irq(dev, lp->irq_mm2s, landeraxidriver_irq, 0, DRIVER_NAME, lp);
-    if (rc) {
-        dev_err(dev, "Failed to request MM2S IRQ %d\n", lp->irq_mm2s);
-        return rc;
-    }
-
-    /* Get S2MM IRQ */
     lp->irq_s2mm = platform_get_irq(pdev, 1);
     if (lp->irq_s2mm < 0) {
-        dev_err(dev, "Failed to get S2MM IRQ\n");
-        return lp->irq_s2mm;
-    }
-
-    /* Request S2MM IRQ */
-    rc = devm_request_irq(dev, lp->irq_s2mm, landeraxidriver_irq, 0, DRIVER_NAME, lp);
-    if (rc) {
-        dev_err(dev, "Failed to request S2MM IRQ %d\n", lp->irq_s2mm);
-        return rc;
+        LOG_ERR(dev, "Failed to get S2MM IRQ\n");
+    } else {
+        ret = devm_request_irq(dev, lp->irq_s2mm, axidma_irq_handler, 0, DRIVER_NAME, lp);
+        if (ret) {
+            LOG_ERR(dev, "Failed to request S2MM IRQ %d\n", lp->irq_s2mm);
+            return ret;
+        }
+        LOG_INFO(dev, "S2MM IRQ %d registered\n", lp->irq_s2mm);
     }
 
     dev_info(dev, "landeraxidriver initialized at 0x%lx, IRQs: MM2S=%d, S2MM=%d\n",
              lp->mem_start, lp->irq_mm2s, lp->irq_s2mm);
 
     platform_set_drvdata(pdev, lp);
+    
+    /* Perform a DMA reset */
+    //axidma_reset(lp);
 
     LOG_INFO(dev, "AXI DMA successfully probed\n");
     return 0;
@@ -168,7 +167,12 @@ static int axidma_remove(struct platform_device *pdev)
 
     LOG_INFO(&pdev->dev, "Removing AXI DMA driver\n");
 
-    platform_set_drvdata(pdev, NULL);
+    /* Unmap interrupts */
+    if (lp->irq_mm2s)
+        devm_free_irq(&pdev->dev, lp->irq_mm2s, lp);
+    if (lp->irq_s2mm)
+        devm_free_irq(&pdev->dev, lp->irq_s2mm, lp);
+
     return 0;
 }
 
