@@ -60,10 +60,10 @@ static void axidma_reset(struct axidma_local *lp)
     axidma_write(lp, DMA_S2MM_CTRL_OFFSET, DMA_RESET_MASK);
 
     /* Wait for the reset to complete */
-    while (axidma_read(lp, DMA_MM2S_CTRL_OFFSET) & DMA_RESET_MASK ||
-           axidma_read(lp, DMA_S2MM_CTRL_OFFSET) & DMA_RESET_MASK) {
-        LOG_INFO(NULL, "Waiting for DMA reset to complete...\n");
-    }
+    // while (axidma_read(lp, DMA_MM2S_CTRL_OFFSET) & DMA_RESET_MASK ||
+    //        axidma_read(lp, DMA_S2MM_CTRL_OFFSET) & DMA_RESET_MASK) {
+    //     LOG_INFO(NULL, "Waiting for DMA reset to complete...\n");
+    // }
 
     LOG_INFO(NULL, "AXI DMA reset completed.\n");
 }
@@ -155,7 +155,7 @@ static int axidma_probe(struct platform_device *pdev)
     platform_set_drvdata(pdev, lp);
     
     /* Perform a DMA reset */
-    // axidma_reset(lp);
+    axidma_reset(lp);
 
     LOG_INFO(dev, "AXI DMA successfully probed\n");
     return 0;
