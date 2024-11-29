@@ -1,4 +1,4 @@
-obj-m += axi_dma_driver.o
+obj-m += dma_pcm_module.o
 
 all:
 	make -C /lib/modules/$(shell uname -r)/build M=$(PWD) modules
