@@ -274,13 +274,27 @@ static int dma_pcm_trigger(struct snd_pcm_substream *substream, int cmd)
     case SNDRV_PCM_TRIGGER_START:
         pr_info("dma-alsa: playback started\n");
         break;
+
     case SNDRV_PCM_TRIGGER_STOP:
         pr_info("dma-alsa: playback stopped\n");
-        dmaengine_terminate_sync(dma_channel); // Stop all DMA transfers
+        dmaengine_terminate_sync(dma_channel);
         break;
+
+    case SNDRV_PCM_TRIGGER_PAUSE_PUSH:
+        pr_info("dma-alsa: playback paused\n");
+        dmaengine_pause(dma_channel);
+        break;
+
+    case SNDRV_PCM_TRIGGER_PAUSE_RELEASE:
+        pr_info("dma-alsa: playback resumed\n");
+        dmaengine_resume(dma_channel);
+        break;
+
     default:
+        pr_err("dma-alsa: unsupported trigger command: %d\n", cmd);
         return -EINVAL;
     }
+
     return 0;
 }
 
