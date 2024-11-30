@@ -101,7 +101,17 @@ static void write_to_buffer(void *data, size_t size)
         size_t space_left = AUDIO_BUFFER_SIZE - buffer_fill_level;
         size_t to_copy = min(space_left, size);
 
-        memcpy((char *)dma_buffer + buffer_fill_level, data, to_copy);
+        /* Format data to 2x24-bit in a 64-bit word */
+        uint8_t *src = data;
+        uint64_t *dst = (uint64_t *)((char *)dma_buffer + buffer_fill_level);
+
+        for (size_t i = 0; i < to_copy; i += 6) {
+            uint32_t left = (src[0] << 16) | (src[1] << 8) | src[2];
+            uint32_t right = (src[3] << 16) | (src[4] << 8) | src[5];
+            *dst++ = ((uint64_t)left << 40) | ((uint64_t)right << 16); // Format: 64 bit on 64 bit systems
+            src += 6;
+        }
+
         buffer_fill_level += to_copy;
         data = (char *)data + to_copy;
         size -= to_copy;
@@ -116,11 +126,11 @@ static void write_to_buffer(void *data, size_t size)
                 pr_err("dma-alsa: dma transfer failed\n");
             }
 
-            /* Change to a new empty buffer */
+            /* Change buffers */
             dma_buffer = next_dma_buffer;
             dma_handle = next_dma_handle;
 
-            /* Allocate a next empty buffer */
+            /* Allocate new empty buffer */
             next_dma_buffer = dma_alloc_coherent(dma_channel->device->dev, AUDIO_BUFFER_SIZE, &next_dma_handle, GFP_KERNEL);
             if (!next_dma_buffer) {
                 pr_err("dma-alsa: couldnt allocate a new buffer\n");
@@ -136,6 +146,7 @@ static void write_to_buffer(void *data, size_t size)
         }
     }
 }
+
 
 /* PCM open callback */
 static int dma_pcm_open(struct snd_pcm_substream *substream)
@@ -191,14 +202,16 @@ static int dma_pcm_trigger(struct snd_pcm_substream *substream, int cmd)
     switch (cmd) {
     case SNDRV_PCM_TRIGGER_START:
         pr_info("dma-alsa: playback started\n");
+        buffer_fill_level = 0; // Reset buffer fill level at start
+        dmaengine_terminate_sync(dma_channel); // Ensure previous DMA transfers are stopped
         break;
     case SNDRV_PCM_TRIGGER_STOP:
         pr_info("dma-alsa: playback stopped\n");
+        dmaengine_terminate_sync(dma_channel); // Stop all DMA transfers
         break;
     default:
         return -EINVAL;
     }
-
     return 0;
 }
 
@@ -223,6 +236,13 @@ static int dma_pcm_hw_params(struct snd_pcm_substream *substream, struct snd_pcm
     return snd_pcm_lib_malloc_pages(substream, params_buffer_bytes(params));
 }
 
+/* PCM pointer callback */
+static snd_pcm_uframes_t dma_pcm_pointer(struct snd_pcm_substream *substream)
+{
+    size_t buffer_pos = buffer_fill_level;
+    return bytes_to_frames(substream->runtime, buffer_pos);
+}
+
 /* PCM operations */
 static struct snd_pcm_ops dma_pcm_ops = {
     .open = dma_pcm_open,
@@ -230,8 +250,8 @@ static struct snd_pcm_ops dma_pcm_ops = {
     .ioctl = snd_pcm_lib_ioctl,
     .hw_params = dma_pcm_hw_params,
     .hw_free = snd_pcm_lib_free_pages,
-    .trigger = dma_pcm_trigger,
-    .pointer = NULL,
+    .trigger = dma_pcm_trigger, // Callback to change the status of the PCM stream: start, stop, pause.
+    .pointer = dma_pcm_pointer, // Callback to report the current position in the playback (DMA buffer) to ALSA
     .ack = dma_pcm_ack,
 };
 
@@ -278,17 +298,26 @@ static int __init dma_pcm_init(void)
 /* Cleanup kernel module */
 static void __exit dma_pcm_exit(void)
 {
+    pr_info("dma-alsa: module cleanup started\n");
     if (dma_channel) {
         dma_release_channel(dma_channel);
         pr_info("dma-alsa: dma channel released\n");
+    }
+
+    if (dma_buffer) {
+        dma_free_coherent(dma_channel->device->dev, AUDIO_BUFFER_SIZE, dma_buffer, dma_handle);
+        pr_info("dma-alsa: dma buffer released\n");
+    }
+
+    if (next_dma_buffer) {
+        dma_free_coherent(dma_channel->device->dev, AUDIO_BUFFER_SIZE, next_dma_buffer, next_dma_handle);
+        pr_info("dma-alsa: next dma buffer released\n");
     }
 
     if (card)
         snd_card_free(card);
 
     pr_info("dma-alsa: module removed\n");
-
-    // TODO: Also freeing of the dma allocated blocks
 }
 
 module_init(dma_pcm_init);
