@@ -45,6 +45,12 @@ static void dma_transfer_callback(void *completion)
         The DMA buffer is released so the memory is free again
     */
 
+    // Check if completion buffer is valid
+    if (!completion) {
+        pr_err("dma-alsa: NULL completion buffer in transfer callback\n");
+        return;
+    }
+
     void *completed_buffer = completion;
     dma_addr_t phys_addr = virt_to_phys(completed_buffer);
 
@@ -84,21 +90,28 @@ static int start_dma_transfer(void *src, size_t len, dma_addr_t phys_addr)
         The callback for completion of the transfer is configured
     */
 
-    struct dma_async_tx_descriptor *desc;
-    dma_cookie_t cookie;
-
-    /* Configure a descriptor for the transfer */
-    desc = dmaengine_prep_slave_single(dma_channel, phys_addr, len, DMA_MEM_TO_DEV, DMA_PREP_INTERRUPT);
-    if (!desc) {
-        pr_err("dma-alsa: couldnt prepare the dma descriptor\n");
+    if (!dma_channel) {
+        pr_err("dma-alsa: dma_channel is NULL, cannot start transfer\n");
         return -EINVAL;
     }
 
-    /* Configure the callback when completed */
+    if (!src) {
+        pr_err("dma-alsa: source buffer is NULL, cannot start transfer\n");
+        return -EINVAL;
+    }
+
+    struct dma_async_tx_descriptor *desc;
+    dma_cookie_t cookie;
+
+    desc = dmaengine_prep_slave_single(dma_channel, phys_addr, len, DMA_MEM_TO_DEV, DMA_PREP_INTERRUPT);
+    if (!desc) {
+        pr_err("dma-alsa: could not prepare the dma descriptor\n");
+        return -EINVAL;
+    }
+
     desc->callback = dma_transfer_callback;
     desc->callback_param = src;
 
-    /* Start the transfer */
     cookie = dmaengine_submit(desc);
     if (dma_submit_error(cookie)) {
         pr_err("dma-alsa: dma transfer submission failed\n");
@@ -107,7 +120,7 @@ static int start_dma_transfer(void *src, size_t len, dma_addr_t phys_addr)
 
     dma_async_issue_pending(dma_channel);
 
-    pr_info("dma-alsa: dma transfer started for a buffer at %p, lenght: %zu bytes\n", src, len);
+    pr_info("dma-alsa: dma transfer started for buffer at %p, length: %zu bytes\n", src, len);
     return 0;
 }
 
@@ -119,6 +132,17 @@ static void write_to_buffer(void *data, size_t size)
         The received data from the ALSA buffer is zero padded and combined to an L/R sample in 1 word (64 bit or 8 bytes)
         If the current dma_buffer is full, the dma transfer is started and a new buffer is assigned
     */
+
+    // Ensure buffers are valid before accessing them
+    if (!dma_buffer) {
+        pr_err("dma-alsa: dma_buffer is NULL, cannot write data\n");
+        return;
+    }
+
+    if (!next_dma_buffer) {
+        pr_err("dma-alsa: next_dma_buffer is NULL, cannot switch buffers\n");
+        return;
+    }
 
     while (size > 0) {
         size_t space_left = AUDIO_BUFFER_SIZE - buffer_fill_level;
@@ -215,16 +239,22 @@ static int dma_pcm_close(struct snd_pcm_substream *substream)
 
     mutex_lock(&dma_lock);
 
+    // Check and release the current buffer
     if (dma_buffer) {
-        pr_info("dma-alsa: released current buffer at %p\n", dma_buffer);
+        pr_info("dma-alsa: releasing current buffer at %p\n", dma_buffer);
         dma_free_coherent(dma_channel->device->dev, AUDIO_BUFFER_SIZE, dma_buffer, dma_handle);
-        dma_buffer = NULL;
+        dma_buffer = NULL; // Prevent double-free
+    } else {
+        pr_warn("dma-alsa: no current buffer to release\n");
     }
 
+    // Check and release the next buffer
     if (next_dma_buffer) {
-        pr_info("dma-alsa: released next empty buffer at %p\n", next_dma_buffer);
+        pr_info("dma-alsa: releasing next buffer at %p\n", next_dma_buffer);
         dma_free_coherent(dma_channel->device->dev, AUDIO_BUFFER_SIZE, next_dma_buffer, next_dma_handle);
-        next_dma_buffer = NULL;
+        next_dma_buffer = NULL; // Prevent double-free
+    } else {
+        pr_warn("dma-alsa: no next buffer to release\n");
     }
 
     mutex_unlock(&dma_lock);
@@ -287,6 +317,16 @@ static int dma_pcm_hw_params(struct snd_pcm_substream *substream, struct snd_pcm
     */
 
     struct snd_pcm_runtime *runtime = substream->runtime;
+
+    if (!runtime) {
+        pr_err("dma-alsa: runtime is NULL\n");
+        return -EINVAL;
+    }
+
+    if (!dma_buffer) {
+        pr_err("dma-alsa: dma_buffer is NULL\n");
+        return -ENOMEM;
+    }
 
     // Check if the sample format is correct
     if (params_format(params) != SNDRV_PCM_FORMAT_S24_3LE) {
@@ -408,23 +448,33 @@ static void __exit dma_pcm_exit(void)
 
     pr_info("dma-alsa: module cleanup started\n");
 
+    // Release buffers with checks
     if (dma_buffer) {
         dma_free_coherent(dma_channel->device->dev, AUDIO_BUFFER_SIZE, dma_buffer, dma_handle);
+        dma_buffer = NULL;
         pr_info("dma-alsa: dma buffer released\n");
+    } else {
+        pr_warn("dma-alsa: dma buffer already released\n");
     }
 
     if (next_dma_buffer) {
         dma_free_coherent(dma_channel->device->dev, AUDIO_BUFFER_SIZE, next_dma_buffer, next_dma_handle);
+        next_dma_buffer = NULL;
         pr_info("dma-alsa: next dma buffer released\n");
+    } else {
+        pr_warn("dma-alsa: next dma buffer already released\n");
     }
 
     if (dma_channel) {
         dma_release_channel(dma_channel);
+        dma_channel = NULL; // Ensure dma_channel is not reused
         pr_info("dma-alsa: dma channel released\n");
     }
 
-    if (card)
+    if (card) {
         snd_card_free(card);
+        card = NULL; // Ensure card is not reused
+    }
 
     pr_info("dma-alsa: module removed\n");
 }
