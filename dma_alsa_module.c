@@ -273,8 +273,6 @@ static int dma_pcm_trigger(struct snd_pcm_substream *substream, int cmd)
     switch (cmd) {
     case SNDRV_PCM_TRIGGER_START:
         pr_info("dma-alsa: playback started\n");
-        buffer_fill_level = 0; // Reset buffer fill level at start
-        dmaengine_terminate_sync(dma_channel); // Ensure previous DMA transfers are stopped
         break;
     case SNDRV_PCM_TRIGGER_STOP:
         pr_info("dma-alsa: playback stopped\n");
@@ -371,6 +369,57 @@ static snd_pcm_uframes_t dma_pcm_pointer(struct snd_pcm_substream *substream)
     return bytes_to_frames(substream->runtime, buffer_pos);
 }
 
+/* PCM hw_free callback */
+static int dma_pcm_hw_free(struct snd_pcm_substream *substream)
+{
+    /*
+    This callback is executed by ALSA to free all hardware and buffers
+        The buffer is freed by resetting the buffer fill level
+    */
+    
+    // Check if the runtime and dma are valid
+    if (!runtime || !dma_buffer) {
+        pr_err("dma-alsa: hw free failed, invalid runtime or buffer\n");
+        return -EINVAL;
+    }
+
+    // Reset buffer management
+    buffer_fill_level = 0;
+    
+    pr_info("dma-alsa: hw free successfull\n");
+    return 0;
+}
+
+/* PCM prepare callback */
+static int dma_pcm_prepare(struct snd_pcm_substream *substream)
+{
+    /*
+    The prepare callback is called by ALSA when a sound stream (playback or capture) is ready to start
+    This occurs just before the trigger callback with the SNDRV_PCM_TRIGGER_START command is called
+        The runtime and DMA buffer need to be checked for existance
+        Earlier DMA transfers need to be stopped
+    */
+
+    struct snd_pcm_runtime *runtime = substream->runtime;
+
+    // Check if the runtime and dma are valid
+    if (!runtime || !dma_buffer) {
+        pr_err("dma-alsa: prepare failed, invalid runtime or buffer\n");
+        return -EINVAL;
+    }
+
+    pr_info("dma-alsa: preparing hw, resetting DMA and buffers\n");
+
+    // Reset buffer management
+    buffer_fill_level = 0;
+
+    // Stop ealier DMA transfers
+    dmaengine_terminate_sync(dma_channel);
+
+    pr_info("dma-alsa: prepare completed successfully\n");
+    return 0;
+}
+
 /* PCM operations */
 static struct snd_pcm_ops dma_pcm_ops = {
     /*
@@ -381,7 +430,8 @@ static struct snd_pcm_ops dma_pcm_ops = {
     .close = dma_pcm_close,
     .ioctl = snd_pcm_lib_ioctl,
     .hw_params = dma_pcm_hw_params,
-    .hw_free = snd_pcm_lib_free_pages,
+    .hw_free = dma_pcm_hw_free,
+    .prepare = dma_pcm_prepare,
     .trigger = dma_pcm_trigger,
     .pointer = dma_pcm_pointer,
     .ack = dma_pcm_ack,
