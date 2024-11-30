@@ -45,13 +45,14 @@ static void dma_transfer_callback(void *completion)
         The DMA buffer is released so the memory is free again
     */
 
+    void *completed_buffer = completion;
+
     // Check if completion buffer is valid
     if (!completion) {
         pr_err("dma-alsa: NULL completion buffer in transfer callback\n");
         return;
     }
 
-    void *completed_buffer = completion;
     dma_addr_t phys_addr = virt_to_phys(completed_buffer);
 
     /* Free the transferred DMA buffer */
@@ -90,6 +91,9 @@ static int start_dma_transfer(void *src, size_t len, dma_addr_t phys_addr)
         The callback for completion of the transfer is configured
     */
 
+    struct dma_async_tx_descriptor *desc;
+    dma_cookie_t cookie;
+
     if (!dma_channel) {
         pr_err("dma-alsa: dma_channel is NULL, cannot start transfer\n");
         return -EINVAL;
@@ -99,9 +103,6 @@ static int start_dma_transfer(void *src, size_t len, dma_addr_t phys_addr)
         pr_err("dma-alsa: source buffer is NULL, cannot start transfer\n");
         return -EINVAL;
     }
-
-    struct dma_async_tx_descriptor *desc;
-    dma_cookie_t cookie;
 
     desc = dmaengine_prep_slave_single(dma_channel, phys_addr, len, DMA_MEM_TO_DEV, DMA_PREP_INTERRUPT);
     if (!desc) {
@@ -391,6 +392,8 @@ static int dma_pcm_hw_free(struct snd_pcm_substream *substream)
         The buffer is freed by resetting the buffer fill level
     */
     
+    struct snd_pcm_runtime *runtime = substream->runtime;
+
     // Check if the runtime and dma are valid
     if (!runtime || !dma_buffer) {
         pr_err("dma-alsa: hw free failed, invalid runtime or buffer\n");
