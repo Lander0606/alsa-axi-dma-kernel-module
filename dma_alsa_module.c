@@ -8,37 +8,42 @@
 
 #define PCM_DEVICE_NAME "dma_pcm"
 #define CARD_NAME "DMA Audio Card"
-#define AUDIO_BUFFER_SIZE (64 * 1024) // 64 KB audio buffer
+#define AUDIO_BUFFER_SIZE (64 * 1024)   // 64 KB audio buffer
 
 static struct snd_card *card;
 static struct snd_pcm *pcm;
-static struct dma_chan *dma_channel; // A DMA Channel
-static void *dma_buffer;             // Active buffer for PCM samples
-static void *next_dma_buffer;        // Next buffer
-static dma_addr_t dma_handle;        // Physical address for active DMA buffer
-static dma_addr_t next_dma_handle;   // Physical address for next buffer
-static struct mutex dma_lock;        // Mutex to protect DMA and buffer changes
-static size_t buffer_fill_level = 0; // Count for the amount of data in a buffer
+static struct dma_chan *dma_channel;    // A DMA Channel
+static void *dma_buffer;                // Active buffer for PCM samples
+static void *next_dma_buffer;           // Next buffer
+static dma_addr_t dma_handle;           // Physical address for active DMA buffer
+static dma_addr_t next_dma_handle;      // Physical address for next buffer
+static struct mutex dma_lock;           // Mutex to protect DMA and buffer changes
+static size_t buffer_fill_level = 0;    // Count for the amount of data in a buffer
 
 /* ALSA PCM hardware parameters */
-static struct snd_pcm_hardware cma_pcm_hardware = {
+static struct snd_pcm_hardware dma_pcm_hardware = {
     .info = SNDRV_PCM_INFO_INTERLEAVED | SNDRV_PCM_INFO_BLOCK_TRANSFER, // Interleaved format (samples L/R on same place in memory) + supports block transfers
-    .formats = SNDRV_PCM_FMTBIT_S24_LE, // 24-bit little-endian samples
-    .rates = SNDRV_PCM_RATE_48000, // Support only 48kHz sample frequency
+    .formats = SNDRV_PCM_FMTBIT_S24_LE,                                 // 24-bit little-endian samples
+    .rates = SNDRV_PCM_RATE_48000,                                      // Support only 48kHz sample frequency
     .rate_min = 48000,
     .rate_max = 48000,
-    .channels_min = 2, // Stereo (L/R)
+    .channels_min = 2,                                                  // Stereo (L/R)
     .channels_max = 2,
-    .buffer_bytes_max = AUDIO_BUFFER_SIZE, // Total buffer size = 64 KB
-    .period_bytes_min = 4096, // Min size of a "period" in the buffer -> 4096 / (6 bytes per frame) = minimal 682 frames per period
-    .period_bytes_max = 16384, // Max size of a "period" in the buffer -> 16384 / (6 bytes per frame) = minimal 2730 frames per period
-    .periods_min = 2, // The buffer needs to contain at least 2 periods
-    .periods_max = 4, // The buffer can contain at most 4 periods
+    .buffer_bytes_max = AUDIO_BUFFER_SIZE,                              // Total buffer size = 64 KB
+    .period_bytes_min = 4096,                                           // Min size of a "period" in the buffer -> 4096 / (6 bytes per frame) = minimal 682 frames per period
+    .period_bytes_max = 16384,                                          // Max size of a "period" in the buffer -> 16384 / (6 bytes per frame) = minimal 2730 frames per period
+    .periods_min = 2,                                                   // The buffer needs to contain at least 2 periods
+    .periods_max = 4,                                                   // The buffer can contain at most 4 periods
 };
 
 /* DMA completed callback */
 static void dma_transfer_callback(void *completion)
 {
+    /*
+    This callback is executed whenever a DMA transfer is completed
+        The DMA buffer is released so the memory is free again
+    */
+
     void *completed_buffer = completion;
     dma_addr_t phys_addr = virt_to_phys(completed_buffer);
 
@@ -51,6 +56,11 @@ static void dma_transfer_callback(void *completion)
 /* Initialize the DMA channel */
 static int init_dma_channel(void)
 {
+    /*
+    This function is part of the __init() of the module to init the dma channel
+        A DMA channel is requested taking into account the parameters set in the mask
+    */
+
     dma_cap_mask_t mask;
     dma_cap_zero(mask);
  	dma_cap_set(DMA_SLAVE|DMA_PRIVATE, mask);
@@ -67,6 +77,12 @@ static int init_dma_channel(void)
 /* Function to start the DMA transfer */
 static int start_dma_transfer(void *src, size_t len, dma_addr_t phys_addr)
 {
+    /*
+    This function is executed in write_to_buffer() to start a dma transfer
+        A descriptor for the transfer is configured
+        The callback for completion of the transfer is configured
+    */
+
     struct dma_async_tx_descriptor *desc;
     dma_cookie_t cookie;
 
@@ -97,6 +113,12 @@ static int start_dma_transfer(void *src, size_t len, dma_addr_t phys_addr)
 /* Write audio to the buffer */
 static void write_to_buffer(void *data, size_t size)
 {
+    /*
+    This function is executed in the .ack callback to add and zero pad the new data to the DMA buffer
+        The received data from the ALSA buffer is zero padded and combined to an L/R sample in 1 word (64 bit or 8 bytes)
+        If the current dma_buffer is full, the dma transfer is started and a new buffer is assigned
+    */
+
     while (size > 0) {
         size_t space_left = AUDIO_BUFFER_SIZE - buffer_fill_level;
         size_t to_copy = min(space_left, size);
@@ -151,6 +173,12 @@ static void write_to_buffer(void *data, size_t size)
 /* PCM open callback */
 static int dma_pcm_open(struct snd_pcm_substream *substream)
 {
+    /*
+    This callback is executed when an application opens the PCM device
+        The hardware specific parameters dma_pcm_hardware are set
+        2 DMA buffers of AUDIO_BUFFER_SIZE are allocated and set to use
+    */
+
     struct snd_pcm_runtime *runtime = substream->runtime;
 
     runtime->hw = dma_pcm_hardware;
@@ -168,7 +196,7 @@ static int dma_pcm_open(struct snd_pcm_substream *substream)
         return -ENOMEM;
     }
 
-    runtime->dma_area = dma_buffer;
+    runtime->dma_area = dma_buffer; // Let ALSA use the dma_buffer as buffer to place frames (sound samples)
     runtime->dma_bytes = AUDIO_BUFFER_SIZE;
 
     pr_info("dma-alsa: pcm opened, buffer allocated at %p\n", dma_buffer);
@@ -178,6 +206,12 @@ static int dma_pcm_open(struct snd_pcm_substream *substream)
 /* PCM close callback */
 static int dma_pcm_close(struct snd_pcm_substream *substream)
 {
+    /*
+    This callback is executed when an application closes the PCM device
+        The mutex lock is requested to release the dma buffers
+        2 DMA buffers are released
+    */
+
     mutex_lock(&dma_lock);
 
     if (dma_buffer) {
@@ -199,6 +233,12 @@ static int dma_pcm_close(struct snd_pcm_substream *substream)
 /* PCM trigger callback */
 static int dma_pcm_trigger(struct snd_pcm_substream *substream, int cmd)
 {
+    /*
+    This callback is executed when a certain trigger is sent to the pcm stream: start, stop, pause
+        The received trigger is determined (start / stop)
+        Action is taken accordingly to the trigger type
+    */
+
     switch (cmd) {
     case SNDRV_PCM_TRIGGER_START:
         pr_info("dma-alsa: playback started\n");
@@ -218,11 +258,18 @@ static int dma_pcm_trigger(struct snd_pcm_substream *substream, int cmd)
 /* PCM ACK callback */
 static int dma_pcm_ack(struct snd_pcm_substream *substream)
 {
+    /*
+    This callback is executed whenever new data from ALSA is available in dma_area
+        The amount of frames in the ALSA buffer is requested in frames
+        The data is fetched from the buffer
+        The data is written to another buffer to be zero padded and transferred with dma (TODO?)
+    */
+
     struct snd_pcm_runtime *runtime = substream->runtime;
     snd_pcm_sframes_t frames = snd_pcm_lib_buffer_bytes(substream);
 
     /* Write data */
-    void *data = runtime->dma_area; // Data of the user
+    void *data = runtime->dma_area; // Data from the application
     size_t size = frames * 6;       // 24-bit stereo, 6 bytes per frame
 
     write_to_buffer(data, size);
@@ -233,31 +280,55 @@ static int dma_pcm_ack(struct snd_pcm_substream *substream)
 /* PCM hw_params callback */
 static int dma_pcm_hw_params(struct snd_pcm_substream *substream, struct snd_pcm_hw_params *params)
 {
+    /*
+    This callback is executed when new parameters of the pcm device need to be set
+        The function just forwards the call to snd_pcm_lib_malloc_pages
+    */
+
     return snd_pcm_lib_malloc_pages(substream, params_buffer_bytes(params));
 }
 
 /* PCM pointer callback */
 static snd_pcm_uframes_t dma_pcm_pointer(struct snd_pcm_substream *substream)
 {
+    /*
+    This callback is executed whenever the application wants to know where this module (the hardware) is located in the playback buffer
+        The buffer fill level is used to calculate how many frames are currently in the buffer
+    */
+
     size_t buffer_pos = buffer_fill_level;
     return bytes_to_frames(substream->runtime, buffer_pos);
 }
 
 /* PCM operations */
 static struct snd_pcm_ops dma_pcm_ops = {
+    /*
+    This struct contains the callback functions for pcm stream operations from ALSA
+    */
+
     .open = dma_pcm_open,
     .close = dma_pcm_close,
     .ioctl = snd_pcm_lib_ioctl,
     .hw_params = dma_pcm_hw_params,
     .hw_free = snd_pcm_lib_free_pages,
-    .trigger = dma_pcm_trigger, // Callback to change the status of the PCM stream: start, stop, pause.
-    .pointer = dma_pcm_pointer, // Callback to report the current position in the playback (DMA buffer) to ALSA
+    .trigger = dma_pcm_trigger,
+    .pointer = dma_pcm_pointer,
     .ack = dma_pcm_ack,
 };
 
 /* Kernel module init */
 static int __init dma_pcm_init(void)
 {
+    /*
+    This function contains the init of the DMA ALSA kernel module
+        A mutex lock for the DMA buffer is created
+        The DMA channel is requested
+        A new sound card is created from this module
+        A new pcm device is created from this module
+        The callback functions for this sound card are set
+        The sound card is registered with the system
+    */
+
     int err;
 
     mutex_init(&dma_lock);
@@ -298,11 +369,14 @@ static int __init dma_pcm_init(void)
 /* Cleanup kernel module */
 static void __exit dma_pcm_exit(void)
 {
+    /*
+    This function contains the exit of the DMA ALSA kernel module
+        The 2 allocated DMA buffers are released
+        The DMA channel is released
+        The sound card is unregistered from the system
+    */
+
     pr_info("dma-alsa: module cleanup started\n");
-    if (dma_channel) {
-        dma_release_channel(dma_channel);
-        pr_info("dma-alsa: dma channel released\n");
-    }
 
     if (dma_buffer) {
         dma_free_coherent(dma_channel->device->dev, AUDIO_BUFFER_SIZE, dma_buffer, dma_handle);
@@ -312,6 +386,11 @@ static void __exit dma_pcm_exit(void)
     if (next_dma_buffer) {
         dma_free_coherent(dma_channel->device->dev, AUDIO_BUFFER_SIZE, next_dma_buffer, next_dma_handle);
         pr_info("dma-alsa: next dma buffer released\n");
+    }
+
+    if (dma_channel) {
+        dma_release_channel(dma_channel);
+        pr_info("dma-alsa: dma channel released\n");
     }
 
     if (card)
