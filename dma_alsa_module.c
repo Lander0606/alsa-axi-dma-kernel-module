@@ -5,6 +5,7 @@
 #include <linux/mutex.h>
 #include <sound/core.h>
 #include <sound/pcm.h>
+#include <sound/pcm_params.h>
 
 #define PCM_DEVICE_NAME "dma_pcm"
 #define CARD_NAME "DMA Audio Card"
@@ -23,7 +24,7 @@ static size_t buffer_fill_level = 0;    // Count for the amount of data in a buf
 /* ALSA PCM hardware parameters */
 static struct snd_pcm_hardware dma_pcm_hardware = {
     .info = SNDRV_PCM_INFO_INTERLEAVED | SNDRV_PCM_INFO_BLOCK_TRANSFER, // Interleaved format (samples L/R on same place in memory) + supports block transfers
-    .formats = SNDRV_PCM_FMTBIT_S24_LE,                                 // 24-bit little-endian samples
+    .formats = SNDRV_PCM_FMTBIT_S24_3LE,                                 // 24-bit little-endian samples
     .rates = SNDRV_PCM_RATE_48000,                                      // Support only 48kHz sample frequency
     .rate_min = 48000,
     .rate_max = 48000,
@@ -285,7 +286,37 @@ static int dma_pcm_hw_params(struct snd_pcm_substream *substream, struct snd_pcm
         The function just forwards the call to snd_pcm_lib_malloc_pages
     */
 
-    return snd_pcm_lib_malloc_pages(substream, params_buffer_bytes(params));
+    struct snd_pcm_runtime *runtime = substream->runtime;
+
+    // Check if the sample format is correct
+    if (params_format(params) != SNDRV_PCM_FORMAT_S24_3LE) {
+        pr_err("dma-alsa: unsupported format requested: %d\n", params_format(params));
+        return -EINVAL;
+    }
+
+    // Check if sample rate is correct
+    if (params_rate(params) != 48000) {
+        pr_err("dma-alsa: unsupported sample rate\n");
+        return -EINVAL;
+    }
+
+    // Check if number of channels is correct
+    if (params_channels(params) != 2) {
+        pr_err("dma-alsa: unsupported number of channels requested: %d\n", params_channels(params));
+        return -EINVAL;
+    }
+
+    // Keep the existing buffer settings
+    runtime->dma_area = dma_buffer;
+    runtime->dma_bytes = AUDIO_BUFFER_SIZE;
+
+    if (!runtime->dma_area) {
+        pr_err("dma-alsa: unable to allocate DMA buffer\n");
+        return -ENOMEM;
+    }
+
+    pr_info("dma-alsa: hw_params configured, buffer size: %zu, buffer address: %p\n", runtime->dma_bytes, runtime->dma_area);
+    return 0;
 }
 
 /* PCM pointer callback */
@@ -339,8 +370,7 @@ static int __init dma_pcm_init(void)
     if (err)
         return err;
 
-    struct device *dev = dma_channel->device->dev;
-    err = snd_card_new(dev, -1, NULL, THIS_MODULE, 0, &card);
+    err = snd_card_new(dma_channel->device->dev, -1, NULL, THIS_MODULE, 0, &card);
     if (err < 0)
         return err;
 
