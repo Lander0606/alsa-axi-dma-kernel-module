@@ -13,13 +13,17 @@
 
 static struct snd_card *card;
 static struct snd_pcm *pcm;
-static struct dma_chan *dma_channel;    // A DMA Channel
-static void *dma_buffer;                // Active buffer for PCM samples
-static void *next_dma_buffer;           // Next buffer
-static dma_addr_t dma_handle;           // Physical address for active DMA buffer
-static dma_addr_t next_dma_handle;      // Physical address for next buffer
-static struct mutex dma_lock;           // Mutex to protect DMA and buffer changes
-static size_t buffer_fill_level = 0;    // Count for the amount of data in a buffer
+static struct dma_chan *dma_channel;        // A DMA Channel
+static void *alsa_buffer;                   // ALSA buffer for incoming data
+static dma_addr_t alsa_handle;              // Physical address for the ALSA buffer
+static void *dma_buffer1, *dma_buffer2;     // 2 DMA buffers for zero padded data
+static dma_addr_t dma_handle1, dma_handle2; // Physical addresses for the dma buffers
+static void *active_dma_buffer;             // Active DMA buffer to write samples to
+static dma_addr_t active_dma_handle;        // Physical address of the active DMA buffer
+static void *next_dma_buffer;               // Next DMA buffer if the active one is full
+static dma_addr_t next_dma_handle;          // Physical address of the next DMA buffer
+static struct mutex dma_lock;               // Mutex to protect DMA and buffer changes
+static size_t buffer_fill_level = 0;        // Count for the amount of data in a buffer
 
 /* ALSA PCM hardware parameters */
 static struct snd_pcm_hardware dma_pcm_hardware = {
@@ -46,6 +50,7 @@ static void dma_transfer_callback(void *completion)
     */
 
     void *completed_buffer = completion;
+    dma_addr_t phys_addr;
 
     // Check if completion buffer is valid
     if (!completion) {
@@ -53,7 +58,7 @@ static void dma_transfer_callback(void *completion)
         return;
     }
 
-    dma_addr_t phys_addr = virt_to_phys(completed_buffer);
+    phys_addr = virt_to_phys(completed_buffer);
 
     /* Free the transferred DMA buffer */
     dma_free_coherent(dma_channel->device->dev, AUDIO_BUFFER_SIZE, completed_buffer, phys_addr);
@@ -135,23 +140,18 @@ static void write_to_buffer(void *data, size_t size)
     */
 
     // Ensure buffers are valid before accessing them
-    if (!dma_buffer) {
-        pr_err("dma-alsa: dma_buffer is NULL, cannot write data\n");
+    if (!active_dma_buffer || !next_dma_buffer) {
+        pr_err("dma-alsa: write: active or next dma buffer invalid\n");
         return;
     }
 
-    if (!next_dma_buffer) {
-        pr_err("dma-alsa: next_dma_buffer is NULL, cannot switch buffers\n");
-        return;
-    }
-
-    while (size > 0) {
+    while (size > 5) {
         size_t space_left = AUDIO_BUFFER_SIZE - buffer_fill_level;
         size_t to_copy = min(space_left, size);
 
         /* Format data to 2x24-bit in a 64-bit word */
         uint8_t *src = data;
-        uint64_t *dst = (uint64_t *)((char *)dma_buffer + buffer_fill_level);
+        uint64_t *dst = (uint64_t *)((char *)active_dma_buffer + buffer_fill_level);
 
         for (size_t i = 0; i < to_copy; i += 6) {
             uint32_t left = (src[0] << 16) | (src[1] << 8) | src[2];
@@ -170,13 +170,13 @@ static void write_to_buffer(void *data, size_t size)
             mutex_lock(&dma_lock);
 
             /* Start the DMA transfer of the current buffer */
-            if (start_dma_transfer(dma_buffer, AUDIO_BUFFER_SIZE, dma_handle)) {
+            if (start_dma_transfer(active_dma_buffer, AUDIO_BUFFER_SIZE, active_dma_handle)) {
                 pr_err("dma-alsa: dma transfer failed\n");
             }
 
             /* Change buffers */
-            dma_buffer = next_dma_buffer;
-            dma_handle = next_dma_handle;
+            active_dma_buffer = next_dma_buffer;
+            active_dma_handle = next_dma_handle;
 
             /* Allocate new empty buffer */
             next_dma_buffer = dma_alloc_coherent(dma_channel->device->dev, AUDIO_BUFFER_SIZE, &next_dma_handle, GFP_KERNEL);
@@ -185,7 +185,7 @@ static void write_to_buffer(void *data, size_t size)
                 mutex_unlock(&dma_lock);
                 return;
             }
-            pr_info("dma-alsa: new buffer allocated at %p\n", dma_buffer);
+            pr_info("dma-alsa: new buffer allocated at %p\n", active_dma_buffer);
 
             /* Reset the buffer fill level */
             buffer_fill_level = 0;
@@ -193,6 +193,7 @@ static void write_to_buffer(void *data, size_t size)
             mutex_unlock(&dma_lock);
         }
     }
+    pr_info("dma-alsa: processed %zu bytes to DMA buffer\n", size);
 }
 
 
@@ -202,6 +203,7 @@ static int dma_pcm_open(struct snd_pcm_substream *substream)
     /*
     This callback is executed when an application opens the PCM device
         The hardware specific parameters dma_pcm_hardware are set
+        1 ALSA buffer of AUDIO_BUFFER_SIZE is allocated and set to use
         2 DMA buffers of AUDIO_BUFFER_SIZE are allocated and set to use
     */
 
@@ -209,23 +211,40 @@ static int dma_pcm_open(struct snd_pcm_substream *substream)
 
     runtime->hw = dma_pcm_hardware;
 
-    dma_buffer = dma_alloc_coherent(dma_channel->device->dev, AUDIO_BUFFER_SIZE, &dma_handle, GFP_KERNEL);
-    if (!dma_buffer) {
-        pr_err("dma-alsa: couldnt allocate dma buffer\n");
+   /* Allocate ALSA buffer */
+    alsa_buffer = dma_alloc_coherent(dma_channel->device->dev, AUDIO_BUFFER_SIZE, &alsa_handle, GFP_KERNEL);
+    if (!alsa_buffer) {
+        pr_err("dma-alsa: could not allocate ALSA buffer\n");
         return -ENOMEM;
     }
 
-    next_dma_buffer = dma_alloc_coherent(dma_channel->device->dev, AUDIO_BUFFER_SIZE, &next_dma_handle, GFP_KERNEL);
-    if (!next_dma_buffer) {
-        pr_err("dma-alsa: couldnt allocate next dma buffer\n");
-        dma_free_coherent(dma_channel->device->dev, AUDIO_BUFFER_SIZE, dma_buffer, dma_handle);
+    /* Allocate DMA buffers */
+    dma_buffer1 = dma_alloc_coherent(dma_channel->device->dev, AUDIO_BUFFER_SIZE, &dma_handle1, GFP_KERNEL);
+    if (!dma_buffer1) {
+        pr_err("dma-alsa: could not allocate dma_buffer1\n");
+        dma_free_coherent(dma_channel->device->dev, AUDIO_BUFFER_SIZE, alsa_buffer, alsa_handle);
         return -ENOMEM;
     }
 
-    runtime->dma_area = dma_buffer; // Let ALSA use the dma_buffer as buffer to place frames (sound samples)
+    dma_buffer2 = dma_alloc_coherent(dma_channel->device->dev, AUDIO_BUFFER_SIZE, &dma_handle2, GFP_KERNEL);
+    if (!dma_buffer2) {
+        pr_err("dma-alsa: could not allocate dma_buffer2\n");
+        dma_free_coherent(dma_channel->device->dev, AUDIO_BUFFER_SIZE, alsa_buffer, alsa_handle);
+        dma_free_coherent(dma_channel->device->dev, AUDIO_BUFFER_SIZE, dma_buffer1, dma_handle1);
+        return -ENOMEM;
+    }
+
+    /* Set DMA buffers */
+    active_dma_buffer = dma_buffer1;
+    active_dma_handle = dma_handle1;
+    next_dma_buffer = dma_buffer2;
+    next_dma_handle = dma_handle2;
+
+    /* Set ALSA buffers */
+    runtime->dma_area = alsa_buffer;
     runtime->dma_bytes = AUDIO_BUFFER_SIZE;
 
-    pr_info("dma-alsa: pcm opened, buffer allocated at %p\n", dma_buffer);
+    pr_info("dma-alsa: PCM opened, ALSA buffer allocated at %p, DMA buffers allocated at %p and %p\n", alsa_buffer, dma_buffer1, dma_buffer2);
     return 0;
 }
 
@@ -235,27 +254,29 @@ static int dma_pcm_close(struct snd_pcm_substream *substream)
     /*
     This callback is executed when an application closes the PCM device
         The mutex lock is requested to release the dma buffers
+        1 ALSA buffer is released
         2 DMA buffers are released
     */
 
     mutex_lock(&dma_lock);
 
-    // Check and release the current buffer
-    if (dma_buffer) {
-        pr_info("dma-alsa: releasing current buffer at %p\n", dma_buffer);
-        dma_free_coherent(dma_channel->device->dev, AUDIO_BUFFER_SIZE, dma_buffer, dma_handle);
-        dma_buffer = NULL; // Prevent double-free
-    } else {
-        pr_warn("dma-alsa: no current buffer to release\n");
+    // Check and release the ALSA buffer
+    if (alsa_buffer) {
+        dma_free_coherent(dma_channel->device->dev, AUDIO_BUFFER_SIZE, alsa_buffer, alsa_handle);
+        alsa_buffer = NULL;
     }
 
-    // Check and release the next buffer
-    if (next_dma_buffer) {
-        pr_info("dma-alsa: releasing next buffer at %p\n", next_dma_buffer);
-        dma_free_coherent(dma_channel->device->dev, AUDIO_BUFFER_SIZE, next_dma_buffer, next_dma_handle);
-        next_dma_buffer = NULL; // Prevent double-free
-    } else {
-        pr_warn("dma-alsa: no next buffer to release\n");
+    // Check and release the DMA buffers
+    if (dma_buffer1) {
+        dma_free_coherent(dma_channel->device->dev, AUDIO_BUFFER_SIZE, dma_buffer1, dma_handle1);
+        dma_buffer1 = NULL;
+        active_dma_buffer = NULL;
+    }
+
+    if (dma_buffer2) {
+        dma_free_coherent(dma_channel->device->dev, AUDIO_BUFFER_SIZE, dma_buffer2, dma_handle2);
+        dma_buffer2 = NULL;
+        next_dma_buffer = NULL;
     }
 
     mutex_unlock(&dma_lock);
@@ -303,20 +324,56 @@ static int dma_pcm_trigger(struct snd_pcm_substream *substream, int cmd)
 static int dma_pcm_ack(struct snd_pcm_substream *substream)
 {
     /*
-    This callback is executed whenever new data from ALSA is available in dma_area
-        The amount of frames in the ALSA buffer is requested in frames
-        The data is fetched from the buffer
-        The data is written to another buffer to be zero padded and transferred with dma (TODO?)
+    This callback is executed when ALSA has placed data in the PCM ringbuffer and asks the hardware to process it
+        The amount of new frames in the buffer are calculated with appl_ptr (application) and hw_ptr (hardware)
+        The amount of new bytes is calculated from it
+        The new data is written to the DMA buffer
+        ALSA is informed that the information is processed so that the hardware pointer can be updated (by ALSA internally)
+
+    IMPORTANT: appl_ptr and hw_ptr are the application and hardware pointer but are abstract frame indexes rather than memory addresses
     */
 
     struct snd_pcm_runtime *runtime = substream->runtime;
-    snd_pcm_sframes_t frames = snd_pcm_lib_buffer_bytes(substream);
+    size_t avail_frames, size;
+    void *src;
 
-    /* Write data */
-    void *data = runtime->dma_area; // Data from the application
-    size_t size = frames * 6;       // 24-bit stereo, 6 bytes per frame
+    if (!runtime || !runtime->dma_area || !active_dma_buffer) {
+        pr_err("dma-alsa: invalid buffers in ack\n");
+        return -EINVAL;
+    }
 
-    write_to_buffer(data, size);
+    /* Calculate available frames using appl_ptr and hw_ptr */
+    avail_frames = runtime->control->appl_ptr - runtime->status->hw_ptr;
+    if ((ssize_t)avail_frames < 0) {
+        /*
+        If the amount of frames is negative it means that there is a buffer wrap-around in the circular alsa-buffer
+        IMPORTANT: the ALSA buffer is by default a circular buffer: the "PCM ringbuffer"
+        */
+        avail_frames += runtime->buffer_size;
+    }
+
+    if (avail_frames == 0) {
+        pr_info("dma-alsa: no data available in ALSA buffer\n");
+        return 0;
+    }
+
+    size = frames_to_bytes(runtime, avail_frames);
+    src = runtime->dma_area + frames_to_bytes(runtime, runtime->status->hw_ptr);
+
+    pr_debug("dma-alsa: processing %zu bytes from ALSA buffer\n", size);
+
+    /* Write available data to the active DMA buffer */
+    write_to_buffer(src, size);
+
+    // Update hw_ptr with the processed frames
+    processed_frames = avail_frames;
+    runtime->status->hw_ptr += processed_frames;
+
+    // Ensure the wrap-around for the alsa buffer
+    runtime->status->hw_ptr %= runtime->buffer_size;
+
+    /* Inform ALSA that a period has been processed */
+    snd_pcm_period_elapsed(substream);
 
     return 0;
 }
@@ -336,8 +393,8 @@ static int dma_pcm_hw_params(struct snd_pcm_substream *substream, struct snd_pcm
         return -EINVAL;
     }
 
-    if (!dma_buffer) {
-        pr_err("dma-alsa: dma_buffer is NULL\n");
+    if (!alsa_buffer || !active_dma_buffer || !next_dma_buffer) {
+        pr_err("dma-alsa: alsa or dma buffer NULL\n");
         return -ENOMEM;
     }
 
@@ -360,7 +417,7 @@ static int dma_pcm_hw_params(struct snd_pcm_substream *substream, struct snd_pcm
     }
 
     // Keep the existing buffer settings
-    runtime->dma_area = dma_buffer;
+    runtime->dma_area = alsa_buffer;
     runtime->dma_bytes = AUDIO_BUFFER_SIZE;
 
     if (!runtime->dma_area) {
@@ -376,12 +433,16 @@ static int dma_pcm_hw_params(struct snd_pcm_substream *substream, struct snd_pcm
 static snd_pcm_uframes_t dma_pcm_pointer(struct snd_pcm_substream *substream)
 {
     /*
-    This callback is executed whenever the application wants to know where this module (the hardware) is located in the playback buffer
-        The buffer fill level is used to calculate how many frames are currently in the buffer
+    This callback is executed whenever the application wants to know where the hardware pointer
+    is currently located in the ALSA ringbuffer.
     */
 
-    size_t buffer_pos = buffer_fill_level;
-    return bytes_to_frames(substream->runtime, buffer_pos);
+    struct snd_pcm_runtime *runtime = substream->runtime;
+
+    // Return the actual hw_ptr
+    pr_debug("dma-alsa: Returning hw_ptr=%lu frames\n", runtime->status->hw_ptr);
+
+    return runtime->status->hw_ptr;
 }
 
 /* PCM hw_free callback */
@@ -395,7 +456,7 @@ static int dma_pcm_hw_free(struct snd_pcm_substream *substream)
     struct snd_pcm_runtime *runtime = substream->runtime;
 
     // Check if the runtime and dma are valid
-    if (!runtime || !dma_buffer) {
+    if (!runtime || !alsa_buffer || !active_dma_buffer || !next_dma_buffer) {
         pr_err("dma-alsa: hw free failed, invalid runtime or buffer\n");
         return -EINVAL;
     }
@@ -420,7 +481,7 @@ static int dma_pcm_prepare(struct snd_pcm_substream *substream)
     struct snd_pcm_runtime *runtime = substream->runtime;
 
     // Check if the runtime and dma are valid
-    if (!runtime || !dma_buffer) {
+    if (!runtime || !alsa_buffer || !next_dma_buffer || !active_dma_buffer) {
         pr_err("dma-alsa: prepare failed, invalid runtime or buffer\n");
         return -EINVAL;
     }
@@ -508,6 +569,7 @@ static void __exit dma_pcm_exit(void)
 {
     /*
     This function contains the exit of the DMA ALSA kernel module
+        The ALSA buffer is released
         The 2 allocated DMA buffers are released
         The DMA channel is released
         The sound card is unregistered from the system
@@ -516,16 +578,26 @@ static void __exit dma_pcm_exit(void)
     pr_info("dma-alsa: module cleanup started\n");
 
     // Release buffers with checks
-    if (dma_buffer) {
-        dma_free_coherent(dma_channel->device->dev, AUDIO_BUFFER_SIZE, dma_buffer, dma_handle);
-        dma_buffer = NULL;
-        pr_info("dma-alsa: dma buffer released\n");
+    if (alsa_buffer) {
+        dma_free_coherent(dma_channel->device->dev, AUDIO_BUFFER_SIZE, alsa_buffer, alsa_handle);
+        alsa_buffer = NULL;
+        pr_info("dma-alsa: alsa buffer released\n");
     } else {
-        pr_warn("dma-alsa: dma buffer already released\n");
+        pr_warn("dma-alsa: alsa buffer already released\n");
+    }
+
+    if (active_dma_buffer) {
+        dma_free_coherent(dma_channel->device->dev, AUDIO_BUFFER_SIZE, active_dma_buffer, active_dma_handle);
+        dma_buffer1 = NULL;
+        active_dma_buffer = NULL;
+        pr_info("dma-alsa: active dma buffer released\n");
+    } else {
+        pr_warn("dma-alsa: active dma buffer already released\n");
     }
 
     if (next_dma_buffer) {
         dma_free_coherent(dma_channel->device->dev, AUDIO_BUFFER_SIZE, next_dma_buffer, next_dma_handle);
+        dma_buffer2 = NULL;
         next_dma_buffer = NULL;
         pr_info("dma-alsa: next dma buffer released\n");
     } else {
@@ -534,13 +606,13 @@ static void __exit dma_pcm_exit(void)
 
     if (dma_channel) {
         dma_release_channel(dma_channel);
-        dma_channel = NULL; // Ensure dma_channel is not reused
+        dma_channel = NULL;
         pr_info("dma-alsa: dma channel released\n");
     }
 
     if (card) {
         snd_card_free(card);
-        card = NULL; // Ensure card is not reused
+        card = NULL;
     }
 
     pr_info("dma-alsa: module removed\n");
