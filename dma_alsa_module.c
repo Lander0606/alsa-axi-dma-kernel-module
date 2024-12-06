@@ -147,11 +147,11 @@ static void write_to_buffer(void *data, size_t size)
         size_t space_left = AUDIO_BUFFER_SIZE - buffer_fill_level;
         size_t to_copy = min(space_left, size);
 
-        pr_info("dma-alsa: write() will process %zu bytes to DMA buffer\n", size);
-
         /* Format data to 2x24-bit in a 64-bit word */
         uint8_t *src = data;
         uint64_t *dst = (uint64_t *)((char *)active_dma_buffer + buffer_fill_level);
+
+        pr_info("dma-alsa: write() will process %zu bytes to DMA buffer\n", size);
 
         for (size_t i = 0; i < to_copy; i += 6) {
             uint32_t left = (src[0] << 16) | (src[1] << 8) | src[2];
@@ -213,24 +213,28 @@ static int dma_pcm_open(struct snd_pcm_substream *substream)
 
     runtime->hw = dma_pcm_hardware;
 
-    /* Allocate ALSA buffer using ALSA-provided API */
-    if (snd_pcm_lib_malloc_pages(runtime, AUDIO_BUFFER_SIZE) < 0) {
-        pr_err("dma-alsa: could not allocate ALSA buffer using snd_pcm_lib_malloc_pages\n");
-        return -ENOMEM;
-    }
+    /* Preallocate buffer memory */
+    snd_pcm_lib_preallocate_pages(
+        substream,
+        SNDRV_DMA_TYPE_CONTINUOUS,
+        NULL,  // Use NULL for default DMA memory allocator
+        AUDIO_BUFFER_SIZE,
+        AUDIO_BUFFER_SIZE
+    );
+
 
     /* Allocate DMA buffers */
     dma_buffer1 = dma_alloc_coherent(dma_channel->device->dev, AUDIO_BUFFER_SIZE, &dma_handle1, GFP_KERNEL);
     if (!dma_buffer1) {
         pr_err("dma-alsa: could not allocate dma_buffer1\n");
-        snd_pcm_lib_free_pages(runtime);
+        snd_pcm_lib_free_pages(substream);
         return -ENOMEM;
     }
 
     dma_buffer2 = dma_alloc_coherent(dma_channel->device->dev, AUDIO_BUFFER_SIZE, &dma_handle2, GFP_KERNEL);
     if (!dma_buffer2) {
         pr_err("dma-alsa: could not allocate dma_buffer2\n");
-        snd_pcm_lib_free_pages(runtime);
+        snd_pcm_lib_free_pages(substream);
         dma_free_coherent(dma_channel->device->dev, AUDIO_BUFFER_SIZE, dma_buffer1, dma_handle1);
         return -ENOMEM;
     }
@@ -254,12 +258,10 @@ static int dma_pcm_close(struct snd_pcm_substream *substream)
         1 ALSA buffer is released
         2 DMA buffers are released
     */
-    struct snd_pcm_runtime *runtime = substream->runtime;
-
     mutex_lock(&dma_lock);
 
-    /* Free ALSA buffer using ALSA-provided API */
-    snd_pcm_lib_free_pages(runtime);
+    /* Free preallocated buffer memory */
+    snd_pcm_lib_free_pages(substream);
 
     // Check and release the DMA buffers
     if (dma_buffer1) {
@@ -332,10 +334,12 @@ static int dma_pcm_ack(struct snd_pcm_substream *substream)
     size_t avail_frames, size;
     void *src;
 
-    mutex_lock(&dma_lock);
+    trace_printk("dma-alsa: ack called, hw_ptr=%lu, appl_ptr=%lu\n", 
+             runtime->status->hw_ptr, runtime->control->appl_ptr);
 
     if (!runtime || !runtime->dma_area || !active_dma_buffer) {
         pr_err("dma-alsa: invalid buffers in ack\n");
+        mutex_unlock(&dma_lock);
         return -EINVAL;
     }
 
@@ -347,32 +351,22 @@ static int dma_pcm_ack(struct snd_pcm_substream *substream)
 
     if (avail_frames == 0) {
         pr_info("dma-alsa: no data available in ALSA buffer\n");
+        mutex_unlock(&dma_lock);
         return 0;
     }
 
     size = frames_to_bytes(runtime, avail_frames);
     src = runtime->dma_area + frames_to_bytes(runtime, runtime->status->hw_ptr);
 
-    /* Check if src pointer is valid */
-    if ((src < runtime->dma_area) ||
-        (src >= runtime->dma_area + runtime->dma_bytes)) {
-        pr_err("dma-alsa: Invalid src pointer: %p\n", src);
-        return -EINVAL;
-    }
+    pr_debug("dma-alsa: processing %zu bytes from ALSA buffer\n", size);
 
-    //pr_debug("dma-alsa: processing %zu bytes from ALSA buffer\n", size);
-
-    /* Update hw_ptr with the processed frames */
-    // Add write_to_buffer()
-    runtime->status->hw_ptr = (runtime->status->hw_ptr + avail_frames) % runtime->buffer_size;
+    // write_to_buffer()
 
     /* Inform ALSA that a period has been processed if needed */
     if (avail_frames >= runtime->period_size) {
-        //pr_debug("dma-alsa: Period elapsed for hw_ptr=%lu\n", runtime->status->hw_ptr);
-        snd_pcm_period_elapsed(substream);
+        pr_debug("dma-alsa: Period elapsed for hw_ptr=%lu\n", runtime->status->hw_ptr);
+        snd_pcm_period_elapsed_under_stream_lock(substream);
     }
-
-    mutex_unlock(&dma_lock);
 
     return 0;
 }
@@ -386,41 +380,65 @@ static int dma_pcm_hw_params(struct snd_pcm_substream *substream, struct snd_pcm
     */
 
     struct snd_pcm_runtime *runtime = substream->runtime;
+    unsigned int requested_buffer_size = params_buffer_bytes(params);
+    unsigned int requested_period_size = params_period_bytes(params);
 
     if (!runtime) {
         pr_err("dma-alsa: runtime is NULL\n");
         return -EINVAL;
     }
 
-    if (!active_dma_buffer || !next_dma_buffer) {
-        pr_err("dma-alsa: alsa or dma buffer NULL\n");
-        return -ENOMEM;
-    }
-
-    // Check if the sample format is correct
+    // Validation of format, sample rate and channels
     if (params_format(params) != SNDRV_PCM_FORMAT_S24_3LE) {
         pr_err("dma-alsa: unsupported format requested: %d\n", params_format(params));
         return -EINVAL;
     }
 
-    // Check if sample rate is correct
     if (params_rate(params) != 48000) {
-        pr_err("dma-alsa: unsupported sample rate\n");
+        pr_err("dma-alsa: unsupported sample rate requested: %u\n", params_rate(params));
         return -EINVAL;
     }
 
-    // Check if number of channels is correct
     if (params_channels(params) != 2) {
-        pr_err("dma-alsa: unsupported number of channels requested: %d\n", params_channels(params));
+        pr_err("dma-alsa: unsupported number of channels: %u\n", params_channels(params));
         return -EINVAL;
     }
 
-    if (!runtime->dma_area) {
-        pr_err("dma-alsa: unable to allocate DMA buffer\n");
+    pr_info("dma-alsa: runtime->frame_bits=%d, requested_buffer_size=%u, requested_period_size=%u\n",
+        runtime->frame_bits, requested_buffer_size, requested_period_size);
+
+    // Validation of buffer_size and period_size
+    if (requested_buffer_size > AUDIO_BUFFER_SIZE) {
+        pr_warn("dma-alsa: requested buffer_size too large, adjusting to %u\n", AUDIO_BUFFER_SIZE);
+        requested_buffer_size = AUDIO_BUFFER_SIZE;
+    }
+
+    if (requested_period_size < dma_pcm_hardware.period_bytes_min ||
+        requested_period_size > dma_pcm_hardware.period_bytes_max) {
+        pr_warn("dma-alsa: requested period_size out of bounds, adjusting to %u\n",
+                dma_pcm_hardware.period_bytes_min);
+        requested_period_size = dma_pcm_hardware.period_bytes_min;
+    }
+
+    if (requested_buffer_size < (requested_period_size * dma_pcm_hardware.periods_min)) {
+        pr_err("dma-alsa: buffer_size too small for requested period_size\n");
+        return -EINVAL;
+    }
+
+    // Allocation of the ALSA-buffer
+    if (snd_pcm_lib_malloc_pages(substream, requested_buffer_size) < 0) {
+        pr_err("dma-alsa: Failed to allocate ALSA buffer\n");
         return -ENOMEM;
     }
 
-    pr_info("dma-alsa: hw_params configured, alsa buffer size: %zu, alsa buffer address: %p\n", runtime->dma_bytes, runtime->dma_area);
+    // Dynamische configuratie van runtime buffer- en periodinstellingen
+    //runtime->dma_bytes = requested_buffer_size;
+    runtime->period_size = bytes_to_frames(runtime, requested_period_size);
+    runtime->buffer_size = bytes_to_frames(runtime, requested_buffer_size);
+
+    pr_info("dma-alsa: hw_params configured, buffer_size=%zu frames, period_size=%zu frames, address=%p\n",
+            runtime->buffer_size, runtime->period_size, runtime->dma_area);
+
     return 0;
 }
 
@@ -435,16 +453,10 @@ static snd_pcm_uframes_t dma_pcm_pointer(struct snd_pcm_substream *substream)
     struct snd_pcm_runtime *runtime = substream->runtime;
     snd_pcm_uframes_t hw_ptr;
 
-    // Lock the mutex to prevent concurrent access
-    mutex_lock(&dma_lock);
-
     // Get the current hw_ptr safely
     hw_ptr = runtime->status->hw_ptr;
 
-    // Unlock the mutex after accessing hw_ptr
-    mutex_unlock(&dma_lock);
-
-    //pr_info("dma-alsa: Returning hw_ptr=%lu frames\n", hw_ptr);
+    pr_info("dma-alsa: Returning hw_ptr=%lu frames\n", hw_ptr);
 
     return hw_ptr;
 }
@@ -467,6 +479,9 @@ static int dma_pcm_hw_free(struct snd_pcm_substream *substream)
 
     // Reset buffer management
     buffer_fill_level = 0;
+
+    // Free ALSA buffer
+    snd_pcm_lib_free_pages(substream);
     
     pr_info("dma-alsa: hw free successfull\n");
     return 0;
@@ -487,6 +502,11 @@ static int dma_pcm_prepare(struct snd_pcm_substream *substream)
     // Check if the runtime and dma are valid
     if (!runtime || !next_dma_buffer || !active_dma_buffer) {
         pr_err("dma-alsa: prepare failed, invalid runtime or buffer\n");
+        return -EINVAL;
+    }
+
+    if (runtime->buffer_size == 0 || runtime->period_size == 0) {
+        pr_err("dma-alsa: Invalid buffer_size or period_size in prepare\n");
         return -EINVAL;
     }
 
