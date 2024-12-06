@@ -280,43 +280,6 @@ static int dma_pcm_close(struct snd_pcm_substream *substream)
     return 0;
 }
 
-/* PCM trigger callback */
-static int dma_pcm_trigger(struct snd_pcm_substream *substream, int cmd)
-{
-    /*
-    This callback is executed when a certain trigger is sent to the pcm stream: start, stop, pause
-        The received trigger is determined (start / stop)
-        Action is taken accordingly to the trigger type
-    */
-
-    switch (cmd) {
-    case SNDRV_PCM_TRIGGER_START:
-        pr_info("dma-alsa: playback started\n");
-        break;
-
-    case SNDRV_PCM_TRIGGER_STOP:
-        pr_info("dma-alsa: playback stopped\n");
-        dmaengine_terminate_sync(dma_channel);
-        break;
-
-    case SNDRV_PCM_TRIGGER_PAUSE_PUSH:
-        pr_info("dma-alsa: playback paused\n");
-        dmaengine_pause(dma_channel);
-        break;
-
-    case SNDRV_PCM_TRIGGER_PAUSE_RELEASE:
-        pr_info("dma-alsa: playback resumed\n");
-        dmaengine_resume(dma_channel);
-        break;
-
-    default:
-        pr_err("dma-alsa: unsupported trigger command: %d\n", cmd);
-        return -EINVAL;
-    }
-
-    return 0;
-}
-
 /* PCM ACK callback */
 static int dma_pcm_ack(struct snd_pcm_substream *substream)
 {
@@ -334,12 +297,10 @@ static int dma_pcm_ack(struct snd_pcm_substream *substream)
     size_t avail_frames, size;
     void *src;
 
-    trace_printk("dma-alsa: ack called, hw_ptr=%lu, appl_ptr=%lu\n", 
-             runtime->status->hw_ptr, runtime->control->appl_ptr);
+    pr_debug("dma-alsa: Current ALSA state: %d\n", runtime->status->state);
 
     if (!runtime || !runtime->dma_area || !active_dma_buffer) {
         pr_err("dma-alsa: invalid buffers in ack\n");
-        mutex_unlock(&dma_lock);
         return -EINVAL;
     }
 
@@ -351,7 +312,6 @@ static int dma_pcm_ack(struct snd_pcm_substream *substream)
 
     if (avail_frames == 0) {
         pr_info("dma-alsa: no data available in ALSA buffer\n");
-        mutex_unlock(&dma_lock);
         return 0;
     }
 
@@ -362,8 +322,11 @@ static int dma_pcm_ack(struct snd_pcm_substream *substream)
 
     // write_to_buffer()
 
+    /* Update hw_ptr for ALSA's internal tracking */
+    runtime->status->hw_ptr = (runtime->status->hw_ptr + avail_frames) % runtime->buffer_size;
+
     /* Inform ALSA that a period has been processed if needed */
-    if (avail_frames >= runtime->period_size) {
+    if (runtime->status->state == SNDRV_PCM_STATE_RUNNING && avail_frames >= runtime->period_size) {
         pr_debug("dma-alsa: Period elapsed for hw_ptr=%lu\n", runtime->status->hw_ptr);
         snd_pcm_period_elapsed_under_stream_lock(substream);
     }
@@ -415,7 +378,7 @@ static int dma_pcm_hw_params(struct snd_pcm_substream *substream, struct snd_pcm
 
     if (requested_period_size < dma_pcm_hardware.period_bytes_min ||
         requested_period_size > dma_pcm_hardware.period_bytes_max) {
-        pr_warn("dma-alsa: requested period_size out of bounds, adjusting to %u\n",
+        pr_warn("dma-alsa: requested period_size out of bounds, adjusting to %zu\n",
                 dma_pcm_hardware.period_bytes_min);
         requested_period_size = dma_pcm_hardware.period_bytes_min;
     }
@@ -433,8 +396,11 @@ static int dma_pcm_hw_params(struct snd_pcm_substream *substream, struct snd_pcm
 
     // Dynamische configuratie van runtime buffer- en periodinstellingen
     //runtime->dma_bytes = requested_buffer_size;
+    runtime->frame_bits = params_channels(params) * snd_pcm_format_physical_width(params_format(params));
     runtime->period_size = bytes_to_frames(runtime, requested_period_size);
     runtime->buffer_size = bytes_to_frames(runtime, requested_buffer_size);
+    runtime->start_threshold = runtime->buffer_size / 2;
+    runtime->control->avail_min = runtime->period_size;
 
     pr_info("dma-alsa: hw_params configured, buffer_size=%zu frames, period_size=%zu frames, address=%p\n",
             runtime->buffer_size, runtime->period_size, runtime->dma_area);
@@ -519,6 +485,46 @@ static int dma_pcm_prepare(struct snd_pcm_substream *substream)
     dmaengine_terminate_sync(dma_channel);
 
     pr_info("dma-alsa: prepare completed successfully\n");
+    return 0;
+}
+
+/* PCM trigger callback */
+static int dma_pcm_trigger(struct snd_pcm_substream *substream, int cmd)
+{
+    /*
+    This callback is executed when a certain trigger is sent to the pcm stream: start, stop, pause
+        The received trigger is determined (start / stop)
+        Action is taken accordingly to the trigger type
+    */
+    struct snd_pcm_runtime *runtime = substream->runtime;
+
+    pr_debug("dma-alsa: Current ALSA state: %d\n", runtime->status->state);
+
+    switch (cmd) {
+    case SNDRV_PCM_TRIGGER_START:
+        pr_info("dma-alsa: playback started\n");
+        break;
+
+    case SNDRV_PCM_TRIGGER_STOP:
+        pr_info("dma-alsa: playback stopped\n");
+        dmaengine_terminate_sync(dma_channel);
+        break;
+
+    case SNDRV_PCM_TRIGGER_PAUSE_PUSH:
+        pr_info("dma-alsa: playback paused\n");
+        dmaengine_pause(dma_channel);
+        break;
+
+    case SNDRV_PCM_TRIGGER_PAUSE_RELEASE:
+        pr_info("dma-alsa: playback resumed\n");
+        dmaengine_resume(dma_channel);
+        break;
+
+    default:
+        pr_err("dma-alsa: unsupported trigger command: %d\n", cmd);
+        return -EINVAL;
+    }
+
     return 0;
 }
 
