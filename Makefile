@@ -1,4 +1,4 @@
-obj-m += dma_pcm_module.o
+obj-m += alsa-axi-dma.o
 
 all:
 	make -C /lib/modules/$(shell uname -r)/build M=$(PWD) modules
